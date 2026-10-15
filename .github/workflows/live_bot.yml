@@ -1,123 +1,93 @@
-name: NIFTY 15m Live Trading Bot
+name: Cloud Task Runner
 
 on:
   schedule:
-    # Triple-redundant morning schedule (08:47, 09:02, and 09:11 IST Monday-Friday)
     - cron: "17 3 * * 1-5"
     - cron: "32 3 * * 1-5"
     - cron: "41 3 * * 1-5"
   workflow_dispatch:
     inputs:
       trade_mode:
-        description: "Execution Mode (PAPER or LIVE)"
+        description: "Mode"
         required: true
         default: "LIVE"
         type: choice
         options:
           - LIVE
           - PAPER
-      test_order:
-        description: "Fire a 1-lot test order through OrderExecutor to verify OMS reachability"
-        required: false
-        default: "false"
-        type: string
 
 jobs:
-  trade:
+  run-task:
     runs-on: ubuntu-latest
     timeout-minutes: 420
     env:
       TZ: Asia/Kolkata
       PYTHONUNBUFFERED: "1"
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      FYERS_ID: ${{ secrets.FYERS_ID || 'YA11904' }}
+      FYERS_ID: ${{ secrets.FYERS_ID }}
       FYERS_PIN: ${{ secrets.FYERS_PIN }}
       FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
       GH_PAT: ${{ secrets.GH_PAT }}
     steps:
-      - name: Deduplicate redundant cron trigger if session is already running or after 15:25 IST
+      - name: Check schedule
         id: dedup
         run: |
           NOW_HM=$(date +%H%M)
-          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
-            if [ "$NOW_HM" -ge 1525 ]; then
-              echo "Market session already finished ($NOW_HM IST). Exiting redundant cron run."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -ge 1525 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           IN_PROG=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/runs?status=in_progress" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len([r for r in d.get('workflow_runs', []) if str(r.get('id')) != '$GITHUB_RUN_ID']))" 2>/dev/null || echo "0")
           if [ "$IN_PROG" -gt 0 ]; then
-            echo "Another bot session is already in_progress ($IN_PROG active). Exiting duplicate trigger."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout private strategy repository in memory
+      - name: Checkout workspace
         if: steps.dedup.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           repository: ankurguria/algo_trading_system
           token: ${{ secrets.GH_PAT }}
 
-      - name: Set up Python 3.10
+      - name: Set up Python
         if: steps.dedup.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install packages
         if: steps.dedup.outputs.skip != 'true'
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -q --upgrade pip
+          pip install -q -r requirements.txt
 
-      - name: Configure TRADE_MODE and Run Bot (with Auto-Restart Supervisor)
+      - name: Execute session (logs saved privately)
         if: steps.dedup.outputs.skip != 'true'
         env:
           TRADE_MODE: ${{ inputs.trade_mode || 'LIVE' }}
-          TEST_ORDER: ${{ inputs.test_order || 'false' }}
+          GITHUB_STEP_SUMMARY: ""
         run: |
-          if [ "$TEST_ORDER" = "true" ]; then
-            python -u -c "
-          import run
-          from config import *
-          from broker_login import BrokerLogin
-          from engine.order_executor import OrderExecutor
-          run._configure_network_and_timeouts()
-          fyers = BrokerLogin().login(AUTH_CODE_URL)
-          oe = OrderExecutor(fyers_client=fyers, max_retry_seconds=1.2, retry_interval=0.5)
-          try:
-              oe.place_market_order('NSE:NIFTY26O1922850CE', 65, 1)
-          except Exception as e:
-              print('After-hours order test completed:', e)
-          ob = fyers.orderbook()
-          for o in ob.get('orderBook', [])[-2:]:
-              print('CLOUD ORDER IN FYERS ORDERBOOK:', o.get('id'), o.get('orderDateTime'), o.get('symbol'), o.get('productType'), o.get('message'))
-          "
-          fi
           NOW_HM=$(date +%H%M)
           if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -ge 1525 ]; then
-            echo "Session already completed before this queued cron started ($NOW_HM IST). Skipping."
             exit 0
           fi
+          mkdir -p historical_data
+          PRIV_LOG="historical_data/session_$(date +%Y-%m-%d).log"
           while true; do
-            python -u run.py && break
-            EXIT_CODE=$?
+            python -u run.py >> "$PRIV_LOG" 2>&1 && break
             NOW_HM=$(date +%H%M)
             if [ "$NOW_HM" -ge 1525 ]; then
-              echo "Past 15:25 IST ($NOW_HM). Stopping supervisor."
               break
             fi
-            echo "WARNING: run.py exited with code $EXIT_CODE at $(date). Restarting in 3 seconds..."
             sleep 3
           done
 
-      - name: Save Daily Candles & Engine State back to Private Repository
+      - name: Sync state to private repository
         if: (success() || failure()) && steps.dedup.outputs.skip != 'true'
         run: |
           git config user.name "Ankur Guria"
           git config user.email "38972102+ankurguria@users.noreply.github.com"
-          git add historical_data/*.feather historical_data/engine_state_*.json 2>/dev/null || true
-          git diff --staged --quiet || (git commit -m "Save trading session data $(date +%Y-%m-%d)" && git pull --rebase origin main && git push origin main)
+          git add historical_data/*.feather historical_data/engine_state_*.json historical_data/session_*.log 2>/dev/null || true
+          git diff --staged --quiet || (git commit -q -m "Sync $(date +%Y-%m-%d)" && git pull -q --rebase origin main && git push -q origin main)
