@@ -71,14 +71,13 @@ jobs:
       - name: Configure TRADE_MODE and Run Bot (with Auto-Restart Supervisor)
         if: steps.dedup.outputs.skip != 'true'
         env:
-          TARGET_MODE: ${{ inputs.trade_mode || 'LIVE' }}
+          TRADE_MODE: ${{ inputs.trade_mode || 'LIVE' }}
         run: |
           NOW_HM=$(date +%H%M)
           if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -ge 1525 ]; then
             echo "Session already completed before this queued cron started ($NOW_HM IST). Skipping."
             exit 0
           fi
-          python -c 'import os, re; m=os.environ.get("TARGET_MODE","LIVE"); c=open("config.py").read(); open("config.py","w").write(re.sub(r"TRADE_MODE\s*=\s*"(PAPER|LIVE)"", f"TRADE_MODE = "{m}"", c))'
           while true; do
             python -u run.py && break
             EXIT_CODE=$?
