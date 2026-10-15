@@ -63,7 +63,7 @@ jobs:
           pip install -q --upgrade pip
           pip install -q -r requirements.txt
 
-      - name: Execute session
+      - name: Execute session (with live sync to private repo)
         if: steps.dedup.outputs.skip != 'true'
         env:
           TRADE_MODE: ${{ inputs.trade_mode || 'LIVE' }}
@@ -73,8 +73,21 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -ge 1525 ]; then
             exit 0
           fi
+          git config user.name "Ankur Guria"
+          git config user.email "38972102+ankurguria@users.noreply.github.com"
           mkdir -p historical_data
           PRIV_LOG="historical_data/session_$(date +%Y-%m-%d).log"
+
+          # Background live log & state pusher: syncs PRIV_LOG and engine_state to private repo every 30s
+          (
+            while true; do
+              sleep 30
+              git add "$PRIV_LOG" historical_data/engine_state_*.json 2>/dev/null || true
+              git diff --staged --quiet || (git commit -q -m "Live log update $(date +%H:%M:%S)" && git pull -q --rebase origin main && git push -q origin main) 2>/dev/null || true
+            done
+          ) &
+          SYNC_PID=$!
+
           while true; do
             python -u run.py >> "$PRIV_LOG" 2>&1 && break
             NOW_HM=$(date +%H%M)
@@ -83,8 +96,9 @@ jobs:
             fi
             sleep 3
           done
+          kill "$SYNC_PID" 2>/dev/null || true
 
-      - name: Sync state
+      - name: Final sync to private repository
         if: (success() || failure()) && steps.dedup.outputs.skip != 'true'
         run: |
           git config user.name "Ankur Guria"
