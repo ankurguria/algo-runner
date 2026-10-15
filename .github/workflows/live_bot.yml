@@ -1,0 +1,106 @@
+name: NIFTY 15m Live Trading Bot
+
+on:
+  schedule:
+    # Triple-redundant morning schedule (08:47, 09:02, and 09:11 IST Monday-Friday)
+    - cron: "17 3 * * 1-5"
+    - cron: "32 3 * * 1-5"
+    - cron: "41 3 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      trade_mode:
+        description: "Execution Mode (PAPER or LIVE)"
+        required: true
+        default: "LIVE"
+        type: choice
+        options:
+          - LIVE
+          - PAPER
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: "1"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FYERS_ID: ${{ secrets.FYERS_ID || 'YA11904' }}
+      FYERS_PIN: ${{ secrets.FYERS_PIN }}
+      FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - name: Deduplicate redundant cron trigger if session is already running or after 15:25 IST
+        id: dedup
+        run: |
+          NOW_HM=$(date +%H%M)
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            if [ "$NOW_HM" -ge 1525 ]; then
+              echo "Market session already finished ($NOW_HM IST). Exiting redundant cron run."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          IN_PROG=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/runs?status=in_progress" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len([r for r in d.get('workflow_runs', []) if str(r.get('id')) != '$GITHUB_RUN_ID']))" 2>/dev/null || echo "0")
+          if [ "$IN_PROG" -gt 0 ]; then
+            echo "Another bot session is already in_progress ($IN_PROG active). Exiting duplicate trigger."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout private strategy repository in memory
+        if: steps.dedup.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ankurguria/algo_trading_system
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Set up Python 3.10
+        if: steps.dedup.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        if: steps.dedup.outputs.skip != 'true'
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure TRADE_MODE and Run Bot (with Auto-Restart Supervisor)
+        if: steps.dedup.outputs.skip != 'true'
+        run: |
+          NOW_HM=$(date +%H%M)
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -ge 1525 ]; then
+            echo "Session already completed before this queued cron started ($NOW_HM IST). Skipping."
+            exit 0
+          fi
+          MODE="${{ inputs.trade_mode || 'LIVE' }}"
+          python -c "
+          import re
+          with open('config.py', 'r') as f:
+              c = f.read()
+          c = re.sub(r'TRADE_MODE\s*=\s*"(PAPER|LIVE)"', f'TRADE_MODE = "{ "$MODE" }"', c)
+          with open('config.py', 'w') as f:
+              f.write(c)
+          "
+          while true; do
+            python -u run.py && break
+            EXIT_CODE=$?
+            NOW_HM=$(date +%H%M)
+            if [ "$NOW_HM" -ge 1525 ]; then
+              echo "Past 15:25 IST ($NOW_HM). Stopping supervisor."
+              break
+            fi
+            echo "WARNING: run.py exited with code $EXIT_CODE at $(date). Restarting in 3 seconds..."
+            sleep 3
+          done
+
+      - name: Save Daily Candles & Engine State back to Private Repository
+        if: (success() || failure()) && steps.dedup.outputs.skip != 'true'
+        run: |
+          git config user.name "Ankur Guria"
+          git config user.email "38972102+ankurguria@users.noreply.github.com"
+          git add historical_data/*.feather historical_data/engine_state_*.json 2>/dev/null || true
+          git diff --staged --quiet || (git commit -m "Save trading session data $(date +%Y-%m-%d)" && git pull --rebase origin main && git push origin main)
