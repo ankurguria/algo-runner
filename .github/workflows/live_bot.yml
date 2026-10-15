@@ -16,6 +16,11 @@ on:
         options:
           - LIVE
           - PAPER
+      test_order:
+        description: "Fire a 1-lot test order through OrderExecutor to verify OMS reachability"
+        required: false
+        default: "false"
+        type: string
 
 jobs:
   trade:
@@ -72,7 +77,26 @@ jobs:
         if: steps.dedup.outputs.skip != 'true'
         env:
           TRADE_MODE: ${{ inputs.trade_mode || 'LIVE' }}
+          TEST_ORDER: ${{ inputs.test_order || 'false' }}
         run: |
+          if [ "$TEST_ORDER" = "true" ]; then
+            python -u -c "
+          import run
+          from config import *
+          from broker_login import BrokerLogin
+          from engine.order_executor import OrderExecutor
+          run._configure_network_and_timeouts()
+          fyers = BrokerLogin().login(AUTH_CODE_URL)
+          oe = OrderExecutor(fyers_client=fyers, max_retry_seconds=1.2, retry_interval=0.5)
+          try:
+              oe.place_market_order('NSE:NIFTY26O1922850CE', 65, 1)
+          except Exception as e:
+              print('After-hours order test completed:', e)
+          ob = fyers.orderbook()
+          for o in ob.get('orderBook', [])[-2:]:
+              print('CLOUD ORDER IN FYERS ORDERBOOK:', o.get('id'), o.get('orderDateTime'), o.get('symbol'), o.get('productType'), o.get('message'))
+          "
+          fi
           NOW_HM=$(date +%H%M)
           if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -ge 1525 ]; then
             echo "Session already completed before this queued cron started ($NOW_HM IST). Skipping."
