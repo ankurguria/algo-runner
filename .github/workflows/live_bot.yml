@@ -2,6 +2,11 @@ name: Cloud Task Runner
 
 on:
   schedule:
+    - cron: "30 22 * * 0-4"
+    - cron: "30 23 * * 0-4"
+    - cron: "30 0 * * 1-5"
+    - cron: "30 1 * * 1-5"
+    - cron: "30 2 * * 1-5"
     - cron: "17 3 * * 1-5"
     - cron: "32 3 * * 1-5"
     - cron: "41 3 * * 1-5"
@@ -29,7 +34,7 @@ jobs:
       FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
       GH_PAT: ${{ secrets.GH_PAT }}
     steps:
-      - name: Check schedule
+      - name: Check schedule & pre-open relay
         id: dedup
         run: |
           NOW_HM=$(date +%H%M)
@@ -39,6 +44,18 @@ jobs:
           fi
           IN_PROG=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/runs?status=in_progress" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len([r for r in d.get('workflow_runs', []) if str(r.get('id')) != '$GITHUB_RUN_ID']))" 2>/dev/null || echo "0")
           if [ "$IN_PROG" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # If a delayed cron lands early in the morning (before 08:50 IST), sleep until 08:55 IST and dispatch a fresh 6h run!
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -lt 0850 ]; then
+            TARGET_EPOCH=$(date -d "today 08:55:00" +%s)
+            NOW_EPOCH=$(date +%s)
+            SLEEP_SEC=$((TARGET_EPOCH - NOW_EPOCH))
+            if [ "$SLEEP_SEC" -gt 0 ] && [ "$SLEEP_SEC" -lt 19800 ]; then
+              sleep "$SLEEP_SEC"
+            fi
+            curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" -d '{"ref":"main","inputs":{"trade_mode":"LIVE"}}'
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -77,24 +94,39 @@ jobs:
           git config user.email "38972102+ankurguria@users.noreply.github.com"
           mkdir -p historical_data
           PRIV_LOG="historical_data/session_$(date +%Y-%m-%d).log"
+          TMP_LOG="/tmp/session_$(date +%Y-%m-%d).log"
+          if [ -f "$PRIV_LOG" ]; then
+            cp "$PRIV_LOG" "$TMP_LOG"
+          fi
 
-          # Background live log & state pusher: disable errexit inside subshell so git diff exit code 1 triggers commit!
+          # Background live log & state pusher: copy from /tmp so git never unlinks the open stdout file descriptor!
           (
             set +e
             while true; do
               sleep 20
+              if [ -f "$TMP_LOG" ]; then
+                cp "$TMP_LOG" "$PRIV_LOG"
+              fi
               git add "$PRIV_LOG" historical_data/engine_state_*.json 2>/dev/null
               if ! git diff --staged --quiet; then
                 git commit -q -m "Live log update $(date +%H:%M:%S)"
-                git rebase --abort 2>/dev/null || true; git pull -q --rebase --autostash -X ours origin main
-                git push -q origin main
+                if ! git push -q origin main 2>/dev/null; then
+                  git fetch -q origin main
+                  git reset -q --soft origin/main
+                  if [ -f "$TMP_LOG" ]; then
+                    cp "$TMP_LOG" "$PRIV_LOG"
+                  fi
+                  git add "$PRIV_LOG" historical_data/engine_state_*.json 2>/dev/null
+                  git commit -q -m "Live log update $(date +%H:%M:%S)"
+                  git push -q origin main
+                fi
               fi
             done
           ) &
           SYNC_PID=$!
 
           while true; do
-            python -u run.py >> "$PRIV_LOG" 2>&1 && break
+            python -u run.py >> "$TMP_LOG" 2>&1 && break
             NOW_HM=$(date +%H%M)
             if [ "$NOW_HM" -ge 1525 ]; then
               break
@@ -102,6 +134,9 @@ jobs:
             sleep 3
           done
           kill "$SYNC_PID" 2>/dev/null || true
+          if [ -f "$TMP_LOG" ]; then
+            cp "$TMP_LOG" "$PRIV_LOG"
+          fi
 
       - name: Final sync to private repository
         if: (success() || failure()) && steps.dedup.outputs.skip != 'true'
@@ -109,9 +144,11 @@ jobs:
           set +e
           git config user.name "Ankur Guria"
           git config user.email "38972102+ankurguria@users.noreply.github.com"
+          if [ -f "/tmp/session_$(date +%Y-%m-%d).log" ]; then
+            cp "/tmp/session_$(date +%Y-%m-%d).log" "historical_data/session_$(date +%Y-%m-%d).log"
+          fi
           git add historical_data/*.feather historical_data/engine_state_*.json historical_data/session_*.log 2>/dev/null
           if ! git diff --staged --quiet; then
             git commit -q -m "Sync $(date +%Y-%m-%d)"
-            git rebase --abort 2>/dev/null || true; git pull -q --rebase --autostash -X ours origin main
-            git push -q origin main
+            git push -q origin main || (git fetch -q origin main && git reset -q --soft origin/main && git add historical_data/* && git commit -q -m "Sync $(date +%Y-%m-%d)" && git push -q origin main)
           fi
