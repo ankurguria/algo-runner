@@ -50,7 +50,7 @@ jobs:
             exit 0
           fi
           IN_PROG=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/runs?status=in_progress" | python3 -c "import sys, json; d=json.load(sys.stdin); print(len([r for r in d.get('workflow_runs', []) if str(r.get('id')) != '$GITHUB_RUN_ID']))" 2>/dev/null || echo "0")
-          if [ "$IN_PROG" -gt 0 ]; then
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$IN_PROG" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
