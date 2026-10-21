@@ -120,7 +120,7 @@ jobs:
                 git commit -q -m "Live log update $(date +%H:%M:%S)"
                 if ! git push -q origin main 2>/dev/null; then
                   git fetch -q origin main
-                  git reset -q --soft origin/main
+                  git reset -q --mixed origin/main
                   if [ -f "$TMP_LOG" ]; then
                     cp "$TMP_LOG" "$PRIV_LOG"
                   fi
@@ -158,5 +158,5 @@ jobs:
           git add historical_data/*.feather historical_data/engine_state_*.json historical_data/session_*.log 2>/dev/null
           if ! git diff --staged --quiet; then
             git commit -q -m "Sync $(date +%Y-%m-%d)"
-            git push -q origin main || (git fetch -q origin main && git reset -q --soft origin/main && git add historical_data/* && git commit -q -m "Sync $(date +%Y-%m-%d)" && git push -q origin main)
+            git push -q origin main || (git fetch -q origin main && git reset -q --mixed origin/main && git add historical_data/* && git commit -q -m "Sync $(date +%Y-%m-%d)" && git push -q origin main)
           fi
