@@ -155,6 +155,13 @@ jobs:
           ) &
           SYNC_PID=$!
 
+          # GitHub-hosted jobs are killed after 6 hours. Runs that start before 09:35 hand over to a
+          # fresh run at 14:47 (after the 14:45 candle check); the successor restores state and finishes the day.
+          if [ "$(date +%H%M)" -lt 0935 ]; then
+            export HANDOFF_AT="14:47:00"
+            echo "Handoff armed for $HANDOFF_AT (job started $(date +%H:%M:%S))."
+          fi
+
           while true; do
             python -u run.py >> "$TMP_LOG" 2>&1 && break
             NOW_HM=$(date +%H%M)
@@ -164,8 +171,27 @@ jobs:
             sleep 3
           done
           kill "$SYNC_PID" 2>/dev/null || true
+          wait "$SYNC_PID" 2>/dev/null || true
+          rm -f .git/index.lock
           if [ -f "$TMP_LOG" ]; then
             cp "$TMP_LOG" "$PRIV_LOG"
+          fi
+
+          if [ -n "${HANDOFF_AT:-}" ] && [ "$(date +%H%M%S)" -ge 144700 ] && [ "$(date +%H%M)" -lt 1520 ]; then
+            echo "Handoff: pushing state, then launching successor run ($(date +%H:%M:%S))..."
+            for attempt in 1 2 3; do
+              git add "$PRIV_LOG" historical_data/engine_state_*.json historical_data/aggregated_data_*.feather 2>/dev/null
+              git diff --staged --quiet || git commit -q -m "Handoff state $(date +%H:%M:%S)"
+              if git push -q origin main; then
+                echo "Handoff state pushed (attempt $attempt)."
+                break
+              fi
+              git fetch -q origin main && git reset -q --mixed origin/main
+            done
+            curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" \
+              -d "{\"ref\":\"main\",\"inputs\":{\"trade_mode\":\"${TRADE_MODE:-LIVE}\"}}"
+            echo "Successor run dispatched at $(date +%H:%M:%S)."
           fi
 
       - name: Final sync to private repository
