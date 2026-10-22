@@ -27,6 +27,11 @@ on:
         options:
           - LIVE
           - PAPER
+      handoff_test:
+        description: "Dry-run the 6h handoff (PAPER only, hands off ~4 min after start)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   run-task:
@@ -157,7 +162,15 @@ jobs:
 
           # GitHub-hosted jobs are killed after 6 hours. Runs that start before 09:35 hand over to a
           # fresh run at 14:47 (after the 14:45 candle check); the successor restores state and finishes the day.
-          if [ "$(date +%H%M)" -lt 0935 ]; then
+          if [ "${{ inputs.handoff_test }}" = "true" ]; then
+            if [ "$TRADE_MODE" != "PAPER" ]; then
+              echo "handoff_test requires trade_mode=PAPER; refusing to run."; exit 1
+            fi
+            export HANDOFF_AT="$(date -d '+4 min' +%H:%M:%S)"
+            export MAX_ENTRY_TIME="23:58:00"
+            export MAX_OPEN_POSITION_TIME="23:59:00"
+            echo "HANDOFF DRY RUN (PAPER): handoff at $HANDOFF_AT."
+          elif [ "$(date +%H%M)" -lt 0935 ]; then
             export HANDOFF_AT="14:47:00"
             echo "Handoff armed for $HANDOFF_AT (job started $(date +%H:%M:%S))."
           fi
@@ -177,7 +190,15 @@ jobs:
             cp "$TMP_LOG" "$PRIV_LOG"
           fi
 
-          if [ -n "${HANDOFF_AT:-}" ] && [ "$(date +%H%M%S)" -ge 144700 ] && [ "$(date +%H%M)" -lt 1520 ]; then
+          HANDOFF_DUE=false
+          if [ -n "${HANDOFF_AT:-}" ] && grep -q "HANDOFF COMPLETE" "$TMP_LOG" 2>/dev/null; then
+            if [ "${{ inputs.handoff_test }}" = "true" ]; then
+              HANDOFF_DUE=true
+            elif [ "$(date +%H%M%S)" -ge 144700 ] && [ "$(date +%H%M)" -lt 1520 ]; then
+              HANDOFF_DUE=true
+            fi
+          fi
+          if [ "$HANDOFF_DUE" = "true" ]; then
             echo "Handoff: pushing state, then launching successor run ($(date +%H:%M:%S))..."
             for attempt in 1 2 3; do
               git add "$PRIV_LOG" historical_data/engine_state_*.json historical_data/aggregated_data_*.feather 2>/dev/null
