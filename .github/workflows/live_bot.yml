@@ -63,9 +63,31 @@ jobs:
               echo "Pre-open relay active: sleeping $SLEEP_SEC seconds until 08:55:00 IST..."
               sleep "$SLEEP_SEC"
             fi
-            curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" -d '{"ref":"main","inputs":{"trade_mode":"LIVE"}}'
+            RELAY=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/runs?status=in_progress&per_page=100" | python3 -c "import sys, json; me=int('$GITHUB_RUN_ID'); rs=[r for r in json.load(sys.stdin).get('workflow_runs', []) if int(r['id']) != me]; print('skip' if any(int(r['id']) < me or r.get('event') == 'workflow_dispatch' for r in rs) else 'go')" 2>/dev/null || echo "go")
+            if [ "$RELAY" = "go" ]; then
+              echo "Relay leader: dispatching today's trading run."
+              curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" -d '{"ref":"main","inputs":{"trade_mode":"LIVE"}}'
+            else
+              echo "Another relay or trading run is active: not dispatching (prevents duplicate bots)."
+            fi
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            DUP=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/runs?status=in_progress&per_page=100" | python3 -c "
+          import sys, json
+          from datetime import datetime
+          rs = json.load(sys.stdin).get('workflow_runs', [])
+          me = int('$GITHUB_RUN_ID')
+          mine = [r for r in rs if int(r['id']) == me]
+          t = lambda r: datetime.strptime(r['created_at'], '%Y-%m-%dT%H:%M:%SZ')
+          dup = bool(mine) and any(int(r['id']) < me and r.get('event') == 'workflow_dispatch' and abs((t(mine[0]) - t(r)).total_seconds()) <= 120 for r in rs)
+          print('dup' if dup else 'ok')" 2>/dev/null || echo "ok")
+            if [ "$DUP" = "dup" ]; then
+              echo "Duplicate trading run detected (same-minute dispatch): exiting to keep exactly one bot."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
