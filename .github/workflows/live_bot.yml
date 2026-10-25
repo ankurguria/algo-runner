@@ -32,6 +32,11 @@ on:
         required: false
         default: false
         type: boolean
+      stop_order_test:
+        description: "LIVE test of resting stop orders with 1 cheap far-OTM option (only runs 15:20:30-15:28 IST)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   run-task:
@@ -159,6 +164,21 @@ jobs:
             done
           ) &
           SYNC_PID=$!
+
+          if [ "${{ inputs.stop_order_test }}" = "true" ]; then
+            NOW_HMS=$(date +%H%M%S)
+            if [ "$TRADE_MODE" != "LIVE" ] || [ "$NOW_HMS" -lt 152030 ] || [ "$NOW_HMS" -gt 152800 ]; then
+              echo "stop_order_test refused: needs trade_mode=LIVE and 15:20:30-15:28:00 IST (now $(date +%H:%M:%S))." | tee -a "$TMP_LOG"
+            else
+              echo "=== EXCHANGE STOP LIVE TEST $(date) ===" >> "$TMP_LOG"
+              python -u tools/exchange_stop_live_test.py auto >> "$TMP_LOG" 2>&1 || true
+            fi
+            kill "$SYNC_PID" 2>/dev/null || true
+            wait "$SYNC_PID" 2>/dev/null || true
+            rm -f .git/index.lock
+            cp "$TMP_LOG" "$PRIV_LOG" 2>/dev/null || true
+            exit 0
+          fi
 
           # GitHub-hosted jobs are killed after 6 hours. Runs that start before 09:35 hand over to a
           # fresh run at 14:47 (after the 14:45 candle check); the successor restores state and finishes the day.
