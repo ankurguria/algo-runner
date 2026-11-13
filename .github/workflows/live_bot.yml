@@ -54,6 +54,25 @@ jobs:
       - name: Check schedule & pre-open relay
         id: dedup
         run: |
+          # Start a trading run and confirm GitHub accepted it (HTTP 204). A rejected dispatch used to
+          # pass silently (9 Nov 2026: expired token, no bot until 13:20). Now: 3 attempts, then fail the job.
+          dispatch_run() {
+            local body="$1" code=000 attempt
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /tmp/dispatch_resp.txt -w "%{http_code}" --max-time 30 -X POST \
+                -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" \
+                -d "$body") || code=000
+              if [ "$code" = "204" ] || [ "$code" = "200" ]; then
+                echo "Dispatch accepted by GitHub (HTTP $code, attempt $attempt)."
+                return 0
+              fi
+              echo "::warning::Dispatch attempt $attempt rejected: HTTP $code $(head -c 300 /tmp/dispatch_resp.txt 2>/dev/null)"
+              if [ "$attempt" -lt 3 ]; then sleep 15; fi
+            done
+            echo "::error title=Trading run NOT started::GitHub rejected the dispatch 3 times (last HTTP $code). Check the GH_PAT secret in algo-runner."
+            return 1
+          }
           NOW_HM=$(date +%H%M)
           if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$NOW_HM" -ge 1525 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -79,13 +98,15 @@ jobs:
               sleep "$SLEEP_SEC"
             fi
             RELAY=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/runs?status=in_progress&per_page=100" | python3 -c "import sys, json; me=int('$GITHUB_RUN_ID'); rs=[r for r in json.load(sys.stdin).get('workflow_runs', []) if int(r['id']) != me]; print('skip' if any(int(r['id']) < me or r.get('event') == 'workflow_dispatch' for r in rs) else 'go')" 2>/dev/null || echo "go")
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             if [ "$RELAY" = "go" ]; then
               echo "Relay leader: dispatching today's trading run."
-              curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" -d '{"ref":"main","inputs":{"trade_mode":"LIVE"}}'
+              if ! dispatch_run '{"ref":"main","inputs":{"trade_mode":"LIVE"}}'; then
+                exit 1
+              fi
             else
               echo "Another relay or trading run is active: not dispatching (prevents duplicate bots)."
             fi
-            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
@@ -235,10 +256,28 @@ jobs:
               fi
               git fetch -q origin main && git reset -q --mixed origin/main
             done
-            curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"trade_mode\":\"${TRADE_MODE:-LIVE}\"}}"
-            echo "Successor run dispatched at $(date +%H:%M:%S)."
+            # Same checked dispatch as the pre-open relay: 3 attempts, else fail the job loudly.
+            HANDOFF_BODY="{\"ref\":\"main\",\"inputs\":{\"trade_mode\":\"${TRADE_MODE:-LIVE}\"}}"
+            SUCCESSOR_OK=false
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /tmp/dispatch_resp.txt -w "%{http_code}" --max-time 30 -X POST \
+                -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/live_bot.yml/dispatches" \
+                -d "$HANDOFF_BODY") || code=000
+              if [ "$code" = "204" ] || [ "$code" = "200" ]; then
+                SUCCESSOR_OK=true
+                break
+              fi
+              echo "::warning::Successor dispatch attempt $attempt rejected: HTTP $code $(head -c 300 /tmp/dispatch_resp.txt 2>/dev/null)"
+              if [ "$attempt" -lt 3 ]; then sleep 15; fi
+            done
+            if [ "$SUCCESSOR_OK" = "true" ]; then
+              echo "Successor run dispatched at $(date +%H:%M:%S) (HTTP $code, attempt $attempt)." | tee -a "$TMP_LOG"
+            else
+              echo "HANDOFF FAILED at $(date +%H:%M:%S): GitHub rejected the successor dispatch 3 times (last HTTP $code). Open positions are NOT being managed by the bot; the resting exchange stop (if any) is the only protection. Check FYERS now." | tee -a "$TMP_LOG"
+              echo "::error title=Handoff FAILED - no bot after 14:47::Successor run not started (last HTTP $code). Check FYERS positions and the GH_PAT secret."
+              exit 1
+            fi
           fi
 
       - name: Final sync to private repository
