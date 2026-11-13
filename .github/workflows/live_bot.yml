@@ -222,6 +222,15 @@ jobs:
             echo "Handoff armed for $HANDOFF_AT (job started $(date +%H:%M:%S))."
           fi
 
+          # Safety-path LIVE test, opt-in per day: only when tools/safety_path_test_date.txt (private repo)
+          # holds today's date. Buys 1 lot of a Rs 3-10 far-OTM option at 14:45:30 so the bot adopts it,
+          # hands it over at 14:47 and squares it off at 15:20. The helper refuses if any position is open.
+          if [ -n "${HANDOFF_AT:-}" ] && [ "${{ inputs.handoff_test }}" != "true" ] && [ "$TRADE_MODE" = "LIVE" ] \
+             && [ "$(tr -d '[:space:]' 2>/dev/null < tools/safety_path_test_date.txt)" = "$(date +%Y-%m-%d)" ]; then
+            echo "SAFETY-PATH TEST armed for today: helper will enter at 14:45:30." | tee -a "$TMP_LOG"
+            ( python -u tools/safety_path_live_test.py enter >> "$TMP_LOG" 2>&1 || true ) &
+          fi
+
           while true; do
             python -u run.py >> "$TMP_LOG" 2>&1 && break
             NOW_HM=$(date +%H%M)
